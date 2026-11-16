@@ -20,6 +20,7 @@ xpd-tools = { path = ".", editable = true }
 bluesky = ">=1.15.1"
 nslsii = { git = "https://github.com/jwlodek/nslsii", rev = "xspress3-fix-for-ophyd-async-main" }
 ophyd-async = { git = "https://github.com/bluesky/ophyd-async", rev = "main" }
+hdf5plugin = ">=7.1.0, <8"
 
 [feature.profile.dependencies]
 
