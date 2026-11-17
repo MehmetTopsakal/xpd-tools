@@ -1,5 +1,13 @@
 """XPD beamline detector interfaces."""
 
+from .dexela import (
+    DexelaBinningMode,
+    DexelaDetector,
+    DexelaDriverIO,
+    DexelaFullWellMode,
+    DexelaReadoutMode,
+    DexelaTriggerMode,
+)
 from .panda import (
     PandAConfiguration,
     switch_panda_configuration,
@@ -17,6 +25,12 @@ from .pilatus4 import (
 from .qepro import QEPro, QEProTEC
 
 __all__ = [
+    "DexelaBinningMode",
+    "DexelaDetector",
+    "DexelaDriverIO",
+    "DexelaFullWellMode",
+    "DexelaReadoutMode",
+    "DexelaTriggerMode",
     "PandAConfiguration",
     "switch_panda_configuration",
     "Pilatus4Detector",
