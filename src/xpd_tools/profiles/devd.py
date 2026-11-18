@@ -34,6 +34,7 @@ from rich import print as rprint
 from tiled.client import from_uri
 
 from xpd_tools.detectors.pilatus4 import Pilatus4Detector
+from xpd_tools.detectors.dexela import DexelaDetector
 from xpd_tools.motors import RotationMotor
 from xpd_tools.plans import *
 from xpd_tools.psylotech import Psylotech
@@ -176,6 +177,7 @@ path_provider = NSLS2PathProvider(
 # (pilatus1-stats1) rather than a variable name, and is typed for the logic below
 pilatus1_stats1 = NDStatsIO("XF:28ID2-ES{Pilatus4-Det:1}Stats1:")
 iris1_stats1 = NDStatsIO("XF:28IDD-ES{Iris-Det:1}Stats1:")
+dexela1_stats1 = NDStatsIO("XF:28IDD-ES:2{Det:DEX}Stats1:")
 
 with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
 
@@ -202,7 +204,23 @@ with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
 
 
 
-
+    # Initialize the Dexela detector object, with an HDF file writer and the stats plugin
+    dexela1 = DexelaDetector(
+        "XF:28IDD-ES:2{Det:DEX}",
+        ADWriterFactory.hdf(path_provider),
+        plugins={"stats1": dexela1_stats1},
+    )
+    # Tell the detector to include stats plugin total reading in step scans
+    dexela1.add_detector_logics(
+        PluginSignalDataLogic(dexela1.driver, dexela1_stats1.total)
+    )
+    # Fly-scan Pilatus  no stats plugin / data logic (practical at ~450 Hz)
+    # TODO: Remove this once we get new ophyd-async release. Flyscan will auto-disable
+    # stepscan only data logic
+    dexela1_fly = DexelaDetector(
+        "XF:28IDD-ES:2{Det:DEX}", ADWriterFactory.hdf(path_provider)
+    )
+    dexela1_fly.set_name("dexela1")  # reuse assets/pilatus1/ per DE
 
 
 
