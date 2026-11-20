@@ -14,7 +14,11 @@ from pathlib import PurePosixPath
 import bluesky.plan_stubs as bps
 import bluesky.plans as bp
 from bluesky.callbacks.best_effort import BestEffortCallback
-from bluesky.run_engine import RunEngine, call_in_bluesky_event_loop
+from bluesky.run_engine import (
+    RunEngine,
+    autoawait_in_bluesky_event_loop,
+    call_in_bluesky_event_loop,  # noqa: F401 - operator namespace
+)
 from bluesky.utils import ProgressBarManager
 from bluesky_tiled_plugins import BufferingWrapper, TiledWriter
 from IPython.core.getipython import get_ipython
@@ -37,7 +41,7 @@ from xpd_tools.detectors.pilatus4 import Pilatus4Detector
 from xpd_tools.motors import RotationMotor
 from xpd_tools.plans import *
 from xpd_tools.psylotech import Psylotech
-from xpd_tools.shutter import PPSShutter, Shutter
+from xpd_tools.shutter import FastShutter, Shutter
 from xpd_tools.tomo import *
 from xpd_tools.tomo import LastDarkFlatUIDTracker
 from xpd_tools.utils import (
@@ -145,12 +149,12 @@ RE.subscribe(bec)
 
 RE.subscribe(LastDarkFlatUIDTracker(RE.md))
 
-# Setup the proposal ID prompt, as well as the autoawait magic
-# Allows for calling `await coro()` directly in the IPython shell
+# Setup the proposal ID prompt, and let `await coro()` run in the IPython shell
 ipython = get_ipython()
 if ipython is not None and isinstance(ipython, TerminalInteractiveShell):
     ipython.prompts = ProposalIDPrompt(RE, ipython)
-    ipython.run_line_magic("autoawait", "call_in_bluesky_event_loop")
+    # Run `await coro()` typed in the shell on the RunEngine's event loop.
+    autoawait_in_bluesky_event_loop(ipython)
     # ipython.run_line_magic("matplotlib", "")
     if not XPDTOOLS_RUNNING_IN_CI:
         tiled_reading_client = c = from_uri("https://tiled.nsls2.bnl.gov")["xpdd"][
@@ -234,7 +238,14 @@ with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
         name="xspress3-1",
     )
 
-with init_devices(mock=True):
-    # TODO(XPDD): Get shutter PVs for the tomo plans
-    fe_shutter = PPSShutter("TEST{Sh:FE}", name="fe_shutter")
-    photon_shutter = Shutter("TEST{Sh:sum}", name="photon_shutter")
+############
+############
+# SHUTTERS #
+############
+############
+with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
+    # The tomo plans only check that the front-end and photon shutters are open,
+    # and open and close the fast shutter. Pass use_shutter=False to skip them.
+    fe_shutter = Shutter("XF:28ID-PPS{Sh:FE}", name="fe_shutter")
+    photon_shutter = Shutter("XF:28IDA-PPS{PSh}", name="photon_shutter")
+    fast_shutter = FastShutter(name="fast_shutter")

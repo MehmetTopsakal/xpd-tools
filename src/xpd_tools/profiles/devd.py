@@ -9,12 +9,16 @@ import os
 os.environ.pop("PYEPICS_LIBCA", None)
 
 from datetime import datetime
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 
 import bluesky.plan_stubs as bps
 import bluesky.plans as bp
 from bluesky.callbacks.best_effort import BestEffortCallback
-from bluesky.run_engine import RunEngine, call_in_bluesky_event_loop
+from bluesky.run_engine import (
+    RunEngine,
+    autoawait_in_bluesky_event_loop,
+    call_in_bluesky_event_loop,  # noqa: F401 - operator namespace
+)
 from bluesky.utils import ProgressBarManager
 from bluesky_tiled_plugins import BufferingWrapper, TiledWriter
 from IPython.core.getipython import get_ipython
@@ -40,7 +44,7 @@ from xpd_tools.detectors.pilatus4 import Pilatus4Detector
 from xpd_tools.motors import RotationMotor
 from xpd_tools.plans import *
 from xpd_tools.psylotech import Psylotech
-from xpd_tools.shutter import PPSShutter, Shutter
+from xpd_tools.shutter import FastShutter, PPSShutter, Shutter
 from xpd_tools.tomo import *
 from xpd_tools.tomo import LastDarkFlatUIDTracker
 from xpd_tools.utils import (
@@ -144,12 +148,12 @@ RE.subscribe(bec)
 
 RE.subscribe(LastDarkFlatUIDTracker(RE.md))
 
-# Setup the proposal ID prompt, as well as the autoawait magic
-# Allows for calling `await coro()` directly in the IPython shell
+# Setup the proposal ID prompt, and let `await coro()` run in the IPython shell
 ipython = get_ipython()
 if ipython is not None and isinstance(ipython, TerminalInteractiveShell):
     ipython.prompts = ProposalIDPrompt(RE, ipython)
-    ipython.run_line_magic("autoawait", "call_in_bluesky_event_loop")
+    # Run `await coro()` typed in the shell on the RunEngine's event loop.
+    autoawait_in_bluesky_event_loop(ipython)
     # ipython.run_line_magic("matplotlib", "")
     if not XPDTOOLS_RUNNING_IN_CI:
         tiled_reading_client = c = from_uri("https://tiled.nsls2.bnl.gov")["xpdd"][
@@ -162,12 +166,19 @@ path_provider = NSLS2PathProvider(
     base_data_dir=PurePosixPath("/nsls2/data/xpd-new/proposals"),
 )
 
+dexela1_path_provider = NSLS2PathProvider(
+    RE.md,  # type: ignore (nslsii types metadata_dict as dict; RE.md is a RedisJSONDict)
+    base_data_dir=PurePosixPath("/nsls2/data/xpd-new/proposals"),
+    base_write_dir=PureWindowsPath("Z:\\proposals"),
+    granularity="year",
+)
 
-########################################################################################
-########################################################################################
-# DETECTORS #######################################
-########################################################################################
-########################################################################################
+
+#############
+#############
+# DETECTORS #
+#############
+#############
 # Created before the devices are, so it keeps the name pilatus1 gives its plugins
 # (pilatus1-stats1) rather than a variable name, and is typed for the logic below
 pilatus1_stats1 = NDStatsIO("XF:28ID2-ES{Pilatus4-Det:1}Stats1:")
@@ -201,7 +212,7 @@ with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
     # with an HDF file writer and the stats plugin
     dexela1 = DexelaDetector(
         "XF:28IDD-ES:2{Det:DEX}",
-        ADWriterFactory.hdf(path_provider),
+        ADWriterFactory.hdf(dexela1_path_provider),
         plugins={"stats1": dexela1_stats1},
     )
     # Tell the detector to include stats plugin total reading in step scans
@@ -212,7 +223,7 @@ with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
     # TODO: Remove this once we get new ophyd-async release. Flyscan will auto-disable
     # stepscan only data logic
     dexela1_fly = DexelaDetector(
-        "XF:28IDD-ES:2{Det:DEX}", ADWriterFactory.hdf(path_provider)
+        "XF:28IDD-ES:2{Det:DEX}", ADWriterFactory.hdf(dexela1_path_provider)
     )
     dexela1_fly.set_name("dexela1")  # reuse assets/pilatus1/ per DE
 
@@ -239,11 +250,11 @@ with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
     )
 
 
-########################################################################################
-########################################################################################
-# MOTORS ##########################################
-########################################################################################
-########################################################################################
+##########
+##########
+# MOTORS #
+##########
+##########
 with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
     # psylo = Psylotech("XF:28ID2-ES{Psylotech:1}", name="psylo")
 
@@ -275,10 +286,17 @@ with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
     )
 
 
+############
+############
+# SHUTTERS #
+############
+############
 with init_devices(mock=True):
-    # TODO(XPDD): Get shutter PVs for the tomo plans
-    fe_shutter = PPSShutter("TEST{Sh:FE}", name="fe_shutter")
-    photon_shutter = Shutter("TEST{Sh:sum}", name="photon_shutter")
+    # The tomo plans only check that the front-end and photon shutters are open,
+    # and open and close the fast shutter. Pass use_shutter=False to skip them.
+    fe_shutter = Shutter("XF:28ID-PPS{Sh:FE}", name="fe_shutter")
+    photon_shutter = Shutter("XF:28IDA-PPS{PSh}", name="photon_shutter")
+    fast_shutter = FastShutter(name="fast_shutter")
 
 
 # # Don't hint the Pilatus image array: BEC would add an empty first plot row for it
