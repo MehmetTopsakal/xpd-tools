@@ -8,6 +8,7 @@ from typing import Annotated as A
 from ophyd_async.core import (
     DetectorTriggerLogic,
     DeviceMock,
+    OnOff,
     SignalDict,
     SignalR,
     SignalRW,
@@ -16,7 +17,6 @@ from ophyd_async.core import (
     default_mock_class,
     set_mock_put_proceeds,
     set_mock_value,
-    OnOff
 )
 from ophyd_async.epics.adcore import (
     ADAcquireLogic,
@@ -29,7 +29,6 @@ from ophyd_async.epics.adcore import (
     prepare_exposures,
     trigger_info_from_driver,
 )
-
 from ophyd_async.epics.core import PvSuffix
 
 # Approximate frame readout time for Allied Vision Alvium cameras
@@ -38,9 +37,9 @@ VIMBA_READOUT_TIME = 0.01
 
 class VimbaTriggerSourceAlvium(StrictEnum):
     """Trigger source options for Allied Vision Alvium cameras.
-    
+
     Matches actual detector: XF:28ID2-ES:2{Det:AV1}cam1:TriggerSource_RBV
-    with choices ('Software', 'Line 0', 'Line 1', 'Line 2', 'Line 3', 
+    with choices ('Software', 'Line 0', 'Line 1', 'Line 2', 'Line 3',
     'Timer0End', 'Timer1End')
     """
 
@@ -55,7 +54,7 @@ class VimbaTriggerSourceAlvium(StrictEnum):
 
 class VimbaOverlapAlvium(StrictEnum):
     """Trigger overlap options for Allied Vision Alvium cameras.
-    
+
     Matches actual detector: XF:28ID2-ES:2{Det:AV1}cam1:TriggerOverlap_RBV
     with choices ('N.A.',)
     """
@@ -65,7 +64,7 @@ class VimbaOverlapAlvium(StrictEnum):
 
 class VimbaExposeOutModeAlvium(StrictEnum):
     """Exposure mode options for Allied Vision Alvium cameras.
-    
+
     Matches actual detector: XF:28ID2-ES:2{Det:AV1}cam1:ExposureMode_RBV
     with choices ('Timed', 'Trigger Width', 'Trigger Controlled')
     """
@@ -77,7 +76,7 @@ class VimbaExposeOutModeAlvium(StrictEnum):
 
 class VimbaDriverIO(ADBaseIO):
     """Vimba driver interface for Allied Vision cameras.
-    
+
     Custom version that matches actual Alvium detector capabilities.
     PV names follow the ADVimba driver template.
     """
@@ -91,7 +90,7 @@ class VimbaDriverIO(ADBaseIO):
 @dataclass
 class VimbaTriggerLogic(DetectorTriggerLogic):
     """Trigger logic for Vimba cameras.
-    
+
     Parameters
     ----------
     driver : VimbaDriverIO
@@ -193,7 +192,7 @@ class VimbaDetectorMock(DeviceMock["VimbaDetector"]):
 @default_mock_class(VimbaDetectorMock)
 class VimbaDetector(AreaDetector[VimbaDriverIO]):
     """Create a Vimba AreaDetector instance for Allied Vision cameras.
-    
+
     Parameters
     ----------
     prefix : str
