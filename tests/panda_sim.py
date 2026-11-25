@@ -148,10 +148,16 @@ class TtlOutBlock(Device):
 
 
 async def add_pcomp_inp(panda: HDFPanda) -> None:
-    """Add the PCOMP1 input signal, which the flyer logic
-    selects but PcompBlock lacks."""
+    """Add signals the flyer logic uses that the typed PandA blocks lack.
+
+    PCOMP1's input and PULSE1's time units come from PVI on a real PandA.
+    """
     panda.pcomp[1].inp = soft_signal_rw(str)
     await panda.pcomp[1].inp.connect(mock=True)  # type: ignore
+    pulse = panda.pulse[1]
+    for name in ("width_units", "step_units", "delay_units"):
+        setattr(pulse, name, soft_signal_rw(str, initial_value="s"))
+        await getattr(pulse, name).connect(mock=True)
 
 
 class HDFPandaWithCalc(HDFPanda):

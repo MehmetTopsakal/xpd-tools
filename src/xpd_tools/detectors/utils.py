@@ -5,12 +5,67 @@ from typing import Any
 
 import bluesky.plan_stubs as bps
 from bluesky.utils import Msg
+from ophyd_async.core import SignalR, derived_signal_r
 from ophyd_async.epics.adcore import (
+    NDROIIO,
+    ADBaseColorMode,
     AreaDetector,
+    NDArrayBaseIO,
+    NDArrayDescription,
     NDPluginBaseIO,
     NDProcessFilterType,
     NDProcessIO,
 )
+
+
+def _roi_output_size(size: int, binning: int) -> int:
+    return size // max(binning, 1)
+
+
+def plugin_array_description(plugin: NDArrayBaseIO) -> NDArrayDescription:
+    """Describe the frames a file writer receives from ``plugin``.
+
+    Use as ``ADWriterFactory.hdf(..., array_description=...)`` when the file
+    writer is fed by a plugin (ROI, transform, ...) that changes the frame
+    size, so the declared shape matches what is written.
+
+    The shape is ``(y, x[, ArraySizeZ])``, which is the on-disk order for both
+    Mono and pixel-interleaved RGB1 (``(y, x, 3)``). ophyd-async would put the
+    RGB1 colour axis first, so RGB1 is reported as Mono here; the colour axis
+    is already in the shape. Other colour modes are still rejected by
+    ophyd-async.
+
+    For an `NDROIIO`, x and y come from ``SizeX/BinX`` and ``SizeY/BinY``,
+    which update as soon as they are written. For other plugins they come from
+    ``ArraySizeX/Y``, which only update when a frame passes through, so take
+    a frame after changing such a plugin.
+
+    The plugin must be passed to the detector's ``plugins`` so its signals
+    connect.
+    """
+
+    def _color_mode(color_mode: ADBaseColorMode) -> ADBaseColorMode:
+        if color_mode == ADBaseColorMode.RGB1:
+            return ADBaseColorMode.MONO
+        return color_mode
+
+    color_mode_signal: SignalR[ADBaseColorMode] = derived_signal_r(
+        _color_mode, color_mode=plugin.color_mode
+    )
+    if isinstance(plugin, NDROIIO):
+        size_y: SignalR[int] = derived_signal_r(
+            _roi_output_size, size=plugin.size_y, binning=plugin.bin_y
+        )
+        size_x: SignalR[int] = derived_signal_r(
+            _roi_output_size, size=plugin.size_x, binning=plugin.bin_x
+        )
+    else:
+        size_y, size_x = plugin.array_size_y, plugin.array_size_x
+    return NDArrayDescription(
+        shape_signals=[size_y, size_x, plugin.array_size_z],
+        data_type_signal=plugin.data_type,
+        color_mode_signal=color_mode_signal,
+    )
 
 
 def get_detector_acq_times(

@@ -5,6 +5,7 @@ from ophyd_async.core import (
     UUIDFilenameProvider,
     get_mock_put,
     init_devices,
+    set_mock_value,
 )
 from panda_sim import HDFPandaWithCalc, add_pcomp_inp
 
@@ -332,3 +333,20 @@ async def test_prepare_without_routes_leaves_ttls(panda: HDFPandaWithCalc):
         "PULSE1.OUT",
     ]
     get_mock_put(panda.div[1].divisor).assert_not_called()
+
+
+@pytest.mark.parametrize("time_based", [True, False])
+async def test_prepare_resets_pulse_units(panda: HDFPandaWithCalc, time_based: bool):
+    # As found on the PandA: ms units round the 1 us position-based width to 0,
+    # so no triggers reach the detectors.
+    pulse = panda.pulse[1]
+    for name in ("width_units", "step_units", "delay_units"):
+        set_mock_value(getattr(pulse, name), "ms")
+    set_mock_value(pulse.delay, 1.0)
+
+    info = _flyscan_info().model_copy(update={"time_based": time_based})
+    await SingleAxisFlyableLogic(panda, 1).on_prepare(info)
+
+    for name in ("width_units", "step_units", "delay_units"):
+        assert await getattr(pulse, name).get_value() == "s"
+    assert await pulse.delay.get_value() == 0

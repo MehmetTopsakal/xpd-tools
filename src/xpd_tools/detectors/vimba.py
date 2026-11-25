@@ -23,11 +23,14 @@ from ophyd_async.epics.adcore import (
     ADAcquireLogic,
     ADBaseDataType,
     ADBaseIO,
+    ADImageMode,
     ADWriterFactory,
     AreaDetector,
     NDFileHDF5IO,
     NDPluginBaseIO,
+    NDProcessIO,
     prepare_exposures,
+    prepare_filter,
     trigger_info_from_driver,
 )
 from ophyd_async.epics.core import PvSuffix
@@ -105,10 +108,14 @@ class VimbaTriggerLogic(DetectorTriggerLogic):
     trigger_input : VimbaTriggerSourceAlvium, optional
         External trigger source line, by default ``SOFTWARE``. Must be set
         to the wired hardware line before using external triggers.
+    process_plugin : NDProcessIO, optional
+        Combines ``exposures_per_collection`` exposures into each written
+        frame by its filter (see ``prepare_filter``), by default None.
     """
 
     driver: VimbaDriverIO
     trigger_input: VimbaTriggerSourceAlvium = VimbaTriggerSourceAlvium.SOFTWARE
+    process_plugin: NDProcessIO | None = None
 
     def config_sigs(self) -> set[SignalR]:
         return {self.driver.readout_time}
@@ -130,15 +137,35 @@ class VimbaTriggerLogic(DetectorTriggerLogic):
 
         With no requested deadtime the frame period is set to the exposure
         plus ``driver.readout_time``, the shortest gap the camera supports.
+
+        Alvium cameras lack the GenICam ``MultiFrame`` mode, so ADVimba runs
+        ``ImageMode=Multiple`` as ``Continuous`` and delivers extra frames
+        before it stops the camera. A single frame therefore uses
+        ``ImageMode=Single`` (``SingleFrame``), and multi-frame internal
+        acquisitions are refused; use ``bp.count(..., num=N)`` instead.
         """
+        if num > 1:
+            raise ValueError(
+                f"Internal triggering of {num} frames per prepare is not "
+                "supported: the camera delivers extra frames in "
+                "ImageMode=Multiple. Use one frame per trigger, e.g. "
+                "num_images=1 with bp.count([det], num=N)."
+            )
         if livetime and not deadtime:
             deadtime = await self.driver.readout_time.get_value()
-        await asyncio.gather(
+        image_mode = ADImageMode.SINGLE if num == 1 else ADImageMode.CONTINUOUS
+        coros = [
             self.driver.trigger_source.set(VimbaTriggerSourceAlvium.SOFTWARE),
             self.driver.trigger_mode.set(OnOff.OFF),
             self.driver.exposure_mode.set(VimbaExposeOutModeAlvium.TIMED),
-            prepare_exposures(self.driver, num, livetime, deadtime),
-        )
+            self.driver.image_mode.set(image_mode),
+            self.driver.num_images.set(num),
+        ]
+        if livetime:
+            coros.append(self.driver.acquire_time.set(livetime))
+            if deadtime:
+                coros.append(self.driver.acquire_period.set(livetime + deadtime))
+        await asyncio.gather(*coros)
 
     async def prepare_edge(self, num: int, livetime: float):
         """Prepare the camera to take one frame per rising trigger edge."""
@@ -160,9 +187,14 @@ class VimbaTriggerLogic(DetectorTriggerLogic):
             prepare_exposures(self.driver, num),
         )
 
+    async def prepare_exposures_per_collection(self, exposures_per_collection: int):
+        await prepare_filter(self.process_plugin, num_filter=exposures_per_collection)
+
     async def default_trigger_info(self):
         """Get default trigger info based on the number of images to acquire."""
-        return await trigger_info_from_driver(self.driver.num_images)
+        return await trigger_info_from_driver(
+            self.driver.num_images, self.process_plugin
+        )
 
 
 class VimbaDetectorMock(DeviceMock["VimbaDetector"]):
@@ -231,6 +263,10 @@ class VimbaDetector(AreaDetector[VimbaDriverIO]):
         Suffix for the driver PV, by default "cam1:"
     trigger_input : VimbaTriggerSourceAlvium, optional
         External trigger source line, by default ``SOFTWARE``
+    proc_suffix : str, optional
+        If provided, an NDProcessIO plugin is created at this suffix and used
+        to combine ``exposures_per_collection`` exposures per frame. The file
+        writer must be fed from this plugin. By default None.
     plugins : dict[str, NDPluginBaseIO], optional
         Additional areaDetector plugins to include, by default None
     config_sigs : Sequence[SignalR], optional
@@ -245,18 +281,20 @@ class VimbaDetector(AreaDetector[VimbaDriverIO]):
         *writer_factories: ADWriterFactory,
         driver_suffix="cam1:",
         trigger_input: VimbaTriggerSourceAlvium = VimbaTriggerSourceAlvium.SOFTWARE,
+        proc_suffix: str | None = None,
         plugins: dict[str, NDPluginBaseIO] | None = None,
         config_sigs: Sequence[SignalR] = (),
         name: str = "",
     ) -> None:
         driver = VimbaDriverIO(prefix + driver_suffix)
+        proc_plugin = NDProcessIO(prefix + proc_suffix) if proc_suffix else None
         super().__init__(
             driver,
             prefix,
             *writer_factories,
             acquire_logic=ADAcquireLogic(driver),
-            trigger_logic=VimbaTriggerLogic(driver, trigger_input),
-            plugins=plugins,
+            trigger_logic=VimbaTriggerLogic(driver, trigger_input, proc_plugin),
+            plugins=(plugins or {}) | ({"proc": proc_plugin} if proc_plugin else {}),
             config_sigs=config_sigs,
             name=name,
         )

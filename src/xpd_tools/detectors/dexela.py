@@ -30,7 +30,9 @@ from ophyd_async.epics.adcore import (
     AreaDetector,
     NDFileHDF5IO,
     NDPluginBaseIO,
+    NDProcessIO,
     prepare_exposures,
+    prepare_filter,
     trigger_info_from_driver,
 )
 from ophyd_async.epics.core import (
@@ -180,9 +182,14 @@ class DexelaDriverIO(StandardReadable, ADBaseIO):
 
 @dataclass
 class DexelaTriggerLogic(DetectorTriggerLogic):
-    """Trigger logic for Dexela detectors."""
+    """Trigger logic for Dexela detectors.
+
+    With a ``process_plugin``, ``exposures_per_collection`` exposures are
+    combined into each written frame by its filter (see ``prepare_filter``).
+    """
 
     driver: DexelaDriverIO
+    process_plugin: NDProcessIO | None = None
 
     def get_deadtime(self, config_values: SignalDict) -> float:
         return DEXELA_READOUT_TIME
@@ -217,9 +224,14 @@ class DexelaTriggerLogic(DetectorTriggerLogic):
             prepare_exposures(self.driver, num),
         )
 
+    async def prepare_exposures_per_collection(self, exposures_per_collection: int):
+        await prepare_filter(self.process_plugin, num_filter=exposures_per_collection)
+
     async def default_trigger_info(self):
         """Get default trigger info based on the number of images to acquire."""
-        return await trigger_info_from_driver(self.driver.num_images)
+        return await trigger_info_from_driver(
+            self.driver.num_images, self.process_plugin
+        )
 
 
 class DexelaDetectorMock(DeviceMock["DexelaDetector"]):
@@ -295,6 +307,10 @@ class DexelaDetector(AreaDetector[DexelaDriverIO]):
         Factories for file writer plugins and their data logics
     driver_suffix : str, optional
         Suffix for the driver PV, by default "cam1:"
+    proc_suffix : str, optional
+        If provided, an NDProcessIO plugin is created at this suffix and used
+        to combine ``exposures_per_collection`` exposures per frame. The file
+        writer must be fed from this plugin. By default None.
     plugins : dict[str, NDPluginBaseIO], optional
         Additional areaDetector plugins to include, by default None
     config_sigs : Sequence[SignalR], optional
@@ -308,18 +324,20 @@ class DexelaDetector(AreaDetector[DexelaDriverIO]):
         prefix: str,
         *writer_factories: ADWriterFactory,
         driver_suffix="cam1:",
+        proc_suffix: str | None = None,
         plugins: dict[str, NDPluginBaseIO] | None = None,
         config_sigs: Sequence[SignalR] = (),
         name: str = "",
     ) -> None:
         driver = DexelaDriverIO(prefix + driver_suffix)
+        proc_plugin = NDProcessIO(prefix + proc_suffix) if proc_suffix else None
         super().__init__(
             driver,
             prefix,
             *writer_factories,
             acquire_logic=ADAcquireLogic(driver),
-            trigger_logic=DexelaTriggerLogic(driver),
-            plugins=plugins,
+            trigger_logic=DexelaTriggerLogic(driver, proc_plugin),
+            plugins=(plugins or {}) | ({"proc": proc_plugin} if proc_plugin else {}),
             config_sigs=config_sigs,
             name=name,
         )

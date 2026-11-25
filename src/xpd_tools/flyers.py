@@ -186,7 +186,16 @@ class SingleAxisFlyableLogic(FlyableLogic[SingleAxisFlyscanInfo, None]):
         pcomp = self.pcomp
         pulse = self.pulse
         calc = self.calc
+        # PULSE1 times below are in seconds, but its units can be changed on the
+        # PandA (e.g. to ms, which rounds a 1 us width to 0 and suppresses every
+        # trigger). Set the units first: changing them rescales stored values.
+        await asyncio.gather(
+            pulse.width_units.set("s"),  # type: ignore
+            pulse.step_units.set("s"),  # type: ignore
+            pulse.delay_units.set("s"),  # type: ignore
+        )
         coros = [
+            pulse.delay.set(0),
             pcomp.dir.set(value.direction),
             pcomp.start.set(value.start),
             calc.out_dataset.set(value.position_dataset_name),
@@ -204,8 +213,8 @@ class SingleAxisFlyableLogic(FlyableLogic[SingleAxisFlyscanInfo, None]):
                     pulse.pulses.set(1),
                     # TODO: Come up with how we can get always valid values
                     # for these. Must be shorter than the pcomp pulses.
-                    pulse.width.set(0.000001),
-                    pulse.step.set(0.000002),
+                    pulse.width.set(0.0001),
+                    pulse.step.set(0.0002),
                 ]
             )
         else:

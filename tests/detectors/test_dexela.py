@@ -11,7 +11,7 @@ from ophyd_async.core import (
     init_devices,
     set_mock_value,
 )
-from ophyd_async.epics.adcore import ADImageMode, ADWriterFactory
+from ophyd_async.epics.adcore import ADImageMode, ADWriterFactory, NDProcessIO
 
 from xpd_tools.detectors.dexela import DexelaDetector, DexelaTriggerMode
 
@@ -89,3 +89,27 @@ def test_mock_internal_acquisition(RE: RunEngine, dexela: DexelaDetector):
 
     assert docs["stop"][0]["exit_status"] == "success"
     assert len(docs["stream_datum"]) == 1
+
+
+async def test_proc_plugin_combines_exposures(tmp_path: Path):
+    path_provider = StaticPathProvider(UUIDFilenameProvider(), tmp_path)
+    async with init_devices(mock=True):
+        dexela = DexelaDetector(
+            "DEX:", ADWriterFactory.hdf(path_provider), proc_suffix="Proc1:"
+        )
+    proc = dexela.get_plugin("proc", NDProcessIO)
+
+    await dexela.prepare(
+        TriggerInfo(number_of_events=2, exposures_per_collection=5, livetime=0.1)
+    )
+
+    assert await proc.enable_filter.get_value()
+    assert await proc.num_filter.get_value() == 5
+    assert await dexela.driver.num_images.get_value() == 10
+
+
+async def test_exposures_per_collection_needs_proc_plugin(dexela: DexelaDetector):
+    with pytest.raises(ValueError, match="Process plugin"):
+        await dexela.prepare(
+            TriggerInfo(number_of_events=1, exposures_per_collection=5, livetime=0.1)
+        )

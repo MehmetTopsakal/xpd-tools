@@ -29,7 +29,13 @@ from nslsii.sync_experiment import sync_experiment
 from ophyd_async.core import (
     init_devices,
 )
-from ophyd_async.epics.adcore import ADWriterFactory, NDStatsIO, PluginSignalDataLogic
+from ophyd_async.epics.adcore import (
+    NDROIIO,
+    ADWriterFactory,
+    NDPluginBaseIO,
+    NDStatsIO,
+    PluginSignalDataLogic,
+)
 
 # from ophyd_async.epics.adcore._data_logic import ADHDFDataLogic
 from ophyd_async.epics.adkinetix import KinetixDetector
@@ -46,6 +52,7 @@ from xpd_tools.detectors import (
 )
 from xpd_tools.detectors.dexela import DexelaDetector
 from xpd_tools.detectors.pilatus4 import Pilatus4Detector
+from xpd_tools.detectors.utils import plugin_array_description
 from xpd_tools.motors import RotationMotor
 from xpd_tools.plans import *
 from xpd_tools.psylotech import Psylotech
@@ -205,7 +212,11 @@ pilatus1_stats1 = NDStatsIO("XF:28ID2-ES{Pilatus4-Det:1}Stats1:")
 iris1_stats1 = NDStatsIO("XF:28IDD-ES{Iris-Det:1}Stats1:")
 dexela1_stats1 = NDStatsIO("XF:28IDD-ES:2{Det:DEX}Stats1:")
 
-with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
+# Once its IOC is back, you can connect it without re-running the profile:
+# call_in_bluesky_event_loop(avt1.connect())
+
+from ophyd_async.core import init_devices, print_connection_status
+with init_devices(mock=XPDTOOLS_RUNNING_IN_CI,  timeout=2.0, on_connect_hook=print_connection_status):
     # Create a PandABox ophyd object
     panda1 = HDFPanda("XF:28ID2-ES{PANDA:1}:", path_provider)
 
@@ -234,6 +245,7 @@ with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
         "XF:28IDD-ES:2{Det:DEX}",
         ADWriterFactory.hdf(dexela1_path_provider),
         plugins={"stats1": dexela1_stats1},
+        proc_suffix="Proc1:"
     )
     # Tell the detector to include stats plugin total reading in step scans
     dexela1.add_detector_logics(
@@ -243,35 +255,70 @@ with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
     # TODO: Remove this once we get new ophyd-async release. Flyscan will auto-disable
     # stepscan only data logic
     dexela1_fly = DexelaDetector(
-        "XF:28IDD-ES:2{Det:DEX}", ADWriterFactory.hdf(dexela1_path_provider)
+        "XF:28IDD-ES:2{Det:DEX}", ADWriterFactory.hdf(dexela1_path_provider),
+        proc_suffix="Proc1:"
     )
     dexela1_fly.set_name("dexela1")  # reuse assets/pilatus1/ per DE
 
     iris1 = KinetixDetector(
         "XF:28IDD-ES{Iris-Det:1}",
         ADWriterFactory.hdf(path_provider),
+        proc_suffix="Proc1:",
         plugins={"stats1": iris1_stats1},
     )
     iris1.add_detector_logics(PluginSignalDataLogic(iris1.driver, iris1_stats1.total))
     # TODO: Remove this once we get new ophyd-async release. Flyscan will auto-disable
     # stepscan only data logic
     iris1_fly = KinetixDetector(
-        "XF:28IDD-ES{Iris-Det:1}", ADWriterFactory.hdf(path_provider)
+        "XF:28IDD-ES{Iris-Det:1}", ADWriterFactory.hdf(path_provider),
+        proc_suffix="Proc1:"
     )
     iris1_fly.set_name("iris1")  #
 
+    # HDF1 is fed by the Trans1 plugin (CAM -> TRANS1 -> HDF1), which rotates
+    # the RGB1 frames, so describe the written frames from Trans1's output.
+    prosilica1_trans1 = NDPluginBaseIO("XF:28IDD-BI{Det-Sample:1}Trans1:")
     prosilica1 = ProsilicaLegacyDetector(
         "XF:28IDD-BI{Det-Sample:1}",
-        ADWriterFactory.hdf(path_provider),
-        name="prosilica1",
+        ADWriterFactory.hdf(
+            path_provider,
+            array_description=plugin_array_description(prosilica1_trans1),
+        ),
+        plugins={"trans1": prosilica1_trans1},
+        name="default",
     )
 
+    # HDF1 is fed by ROI1 (VMB1 -> TRANS1 -> ROI1 -> HDF1), so describe the
+    # written frames from ROI1's output rather than the full-sensor driver size.
+    # HDF1 is fed by the Trans1 plugin (CAM -> TRANS1 -> HDF1), which rotates
+    # the RGB1 frames, so describe the written frames from Trans1's output.
+
+    avt1_roi1 = NDROIIO("XF:28ID2-ES:2{Det:AV1}ROI1:")
+    avt1_trans1 = NDPluginBaseIO("XF:28ID2-ES:2{Det:AV1}Trans1:")
     avt1 = VimbaDetector(
-        "XF:28ID2-ES:2{Det:AV1}", ADWriterFactory.hdf(avt1_path_provider), name="avt1"
+        "XF:28ID2-ES:2{Det:AV1}",
+        ADWriterFactory.hdf(
+            avt1_path_provider, array_description=plugin_array_description(avt1_roi1)
+        ),
+        proc_suffix="Proc1:",
+        plugins={"roi1": avt1_roi1,"trans1": avt1_trans1},
+        name="avt1",
     )
 
+
+    # HDF1 is fed by ROI1 (EVT1 -> TRANS1 -> ROI1 -> HDF1), so describe the
+    # written frames from ROI1's output rather than the full-sensor driver size.
+    # HDF1 is fed by the Trans1 plugin (CAM -> TRANS1 -> HDF1), which rotates
+    # the RGB1 frames, so describe the written frames from Trans1's output.
+    evt1_roi1 = NDROIIO("XF:28IDD-EM1{EVT-Cam:1}ROI1:")
+    evt1_trans1 = NDPluginBaseIO("XF:28IDD-EM1{EVT-Cam:1}Trans1:")
     evt1 = EmergentVisionDetector(
-        "XF:28IDD-EM1{EVT-Cam:1}", ADWriterFactory.hdf(evt1_path_provider), name="evt1"
+        "XF:28IDD-EM1{EVT-Cam:1}",
+        ADWriterFactory.hdf(
+            evt1_path_provider, array_description=plugin_array_description(evt1_roi1)
+        ),
+        plugins={"roi1": evt1_roi1,"trans1": evt1_trans1},
+        name="evt1",
     )
 
     # Xspress3 fluorescence detector (prefix and channels from xpdDacq)
