@@ -17,6 +17,7 @@ from ophyd_async.core import (
     default_mock_class,
     set_mock_put_proceeds,
     set_mock_value,
+    soft_signal_rw,
 )
 from ophyd_async.epics.adcore import (
     ADAcquireLogic,
@@ -31,7 +32,8 @@ from ophyd_async.epics.adcore import (
 )
 from ophyd_async.epics.core import PvSuffix
 
-# Approximate frame readout time for Allied Vision Alvium cameras
+# Default frame readout time (s) for Allied Vision Alvium cameras; tune it at
+# runtime through ``driver.readout_time``.
 VIMBA_READOUT_TIME = 0.01
 
 
@@ -86,6 +88,11 @@ class VimbaDriverIO(ADBaseIO):
     trigger_overlap: A[SignalRW[VimbaOverlapAlvium], PvSuffix.rbv("TriggerOverlap")]
     exposure_mode: A[SignalRW[VimbaExposeOutModeAlvium], PvSuffix.rbv("ExposureMode")]
 
+    def __init__(self, prefix: str, name: str = ""):
+        super().__init__(prefix, name=name)
+        # Not a PV: the minimum gap between frames (s), used as the deadtime
+        self.readout_time = soft_signal_rw(float, initial_value=VIMBA_READOUT_TIME)
+
 
 @dataclass
 class VimbaTriggerLogic(DetectorTriggerLogic):
@@ -96,17 +103,36 @@ class VimbaTriggerLogic(DetectorTriggerLogic):
     driver : VimbaDriverIO
         The camera driver.
     trigger_input : VimbaTriggerSourceAlvium, optional
-        External trigger source line, by default ``SOFTWARE``.
+        External trigger source line, by default ``SOFTWARE``. Must be set
+        to the wired hardware line before using external triggers.
     """
 
     driver: VimbaDriverIO
     trigger_input: VimbaTriggerSourceAlvium = VimbaTriggerSourceAlvium.SOFTWARE
 
+    def config_sigs(self) -> set[SignalR]:
+        return {self.driver.readout_time}
+
     def get_deadtime(self, config_values: SignalDict) -> float:
-        return VIMBA_READOUT_TIME
+        return config_values[self.driver.readout_time]
+
+    def _check_external_input(self) -> None:
+        """Refuse external triggering when no hardware line is configured."""
+        if self.trigger_input == VimbaTriggerSourceAlvium.SOFTWARE:
+            raise ValueError(
+                "External triggering needs trigger_input set to the wired "
+                "hardware line (e.g. VimbaTriggerSourceAlvium.LINE_0), "
+                "not SOFTWARE"
+            )
 
     async def prepare_internal(self, num: int, livetime: float, deadtime: float):
-        """Prepare the camera for internally triggered acquisition."""
+        """Prepare the camera for internally triggered acquisition.
+
+        With no requested deadtime the frame period is set to the exposure
+        plus ``driver.readout_time``, the shortest gap the camera supports.
+        """
+        if livetime and not deadtime:
+            deadtime = await self.driver.readout_time.get_value()
         await asyncio.gather(
             self.driver.trigger_source.set(VimbaTriggerSourceAlvium.SOFTWARE),
             self.driver.trigger_mode.set(OnOff.OFF),
@@ -116,6 +142,7 @@ class VimbaTriggerLogic(DetectorTriggerLogic):
 
     async def prepare_edge(self, num: int, livetime: float):
         """Prepare the camera to take one frame per rising trigger edge."""
+        self._check_external_input()
         await asyncio.gather(
             self.driver.trigger_source.set(self.trigger_input),
             self.driver.trigger_mode.set(OnOff.ON),
@@ -125,6 +152,7 @@ class VimbaTriggerLogic(DetectorTriggerLogic):
 
     async def prepare_level(self, num: int):
         """Prepare the camera to expose while the trigger input is high."""
+        self._check_external_input()
         await asyncio.gather(
             self.driver.trigger_source.set(self.trigger_input),
             self.driver.trigger_mode.set(OnOff.ON),

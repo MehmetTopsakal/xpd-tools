@@ -36,6 +36,7 @@ from ophyd_async.core import (
     default_mock_class,
     set_mock_put_proceeds,
     set_mock_value,
+    soft_signal_rw,
 )
 from ophyd_async.core import (
     StandardReadableFormat as Format,
@@ -55,6 +56,10 @@ from ophyd_async.epics.core import PvSuffix
 
 # The driver's AcquireTime PV is in milliseconds.
 EVT_ACQUIRE_TIME_SCALE = 1000.0
+
+# Default minimum gap between frames (s); tune it at runtime through
+# ``driver.readout_time``.
+EVT_READOUT_TIME = 0.0
 
 
 class EVTPixelFormat(StrictEnum):
@@ -104,6 +109,11 @@ class EmergentVisionDriverIO(StandardReadable, ADBaseIO):
         SignalRW[EnableDisable], PvSuffix.rbv("EVTAutoGain"), Format.CONFIG_SIGNAL
     ]
 
+    def __init__(self, prefix: str, name: str = ""):
+        super().__init__(prefix, name=name)
+        # Not a PV: the minimum gap between frames (s), used as the deadtime
+        self.readout_time = soft_signal_rw(float, initial_value=EVT_READOUT_TIME)
+
 
 def framerate_for_period(period: float) -> int:
     """Largest integer frame rate whose frame period is at least ``period`` s."""
@@ -130,27 +140,36 @@ class EmergentVisionTriggerLogic(DetectorTriggerLogic):
 
     driver: EmergentVisionDriverIO
 
+    def config_sigs(self) -> set[SignalR]:
+        return {self.driver.readout_time}
+
     def get_deadtime(self, config_values: SignalDict) -> float:
-        return 0.0
+        return config_values[self.driver.readout_time]
 
     async def prepare_internal(self, num: int, livetime: float, deadtime: float):
         """Prepare the camera for internally triggered acquisition.
 
-        With a requested deadtime, ``EVTFramerate`` is set to the largest
-        integer rate whose period covers ``livetime + deadtime``.
+        ``EVTFramerate`` is set to the largest integer rate whose period
+        covers ``livetime + deadtime``. With no requested deadtime,
+        ``driver.readout_time`` is used, giving the fastest rate the exposure
+        allows.
         """
         image_mode = ADImageMode.CONTINUOUS if num == 0 else ADImageMode.MULTIPLE
         # The driver overwrites NumImages when ImageMode is written.
         await self.driver.image_mode.set(image_mode)
         coros = [self.driver.num_images.set(num)]
         if livetime:
-            coros.append(
-                self.driver.acquire_time.set(livetime * EVT_ACQUIRE_TIME_SCALE)
-            )
             if deadtime:
-                coros.append(
-                    self.driver.framerate.set(framerate_for_period(livetime + deadtime))
-                )
+                framerate = framerate_for_period(livetime + deadtime)
+            else:
+                # Fastest rate the exposure allows; 1 fps is the slowest the
+                # integer EVTFramerate can go.
+                readout = await self.driver.readout_time.get_value()
+                framerate = max(1, math.floor(1 / (livetime + readout)))
+            coros += [
+                self.driver.acquire_time.set(livetime * EVT_ACQUIRE_TIME_SCALE),
+                self.driver.framerate.set(framerate),
+            ]
         await asyncio.gather(*coros)
 
     async def default_trigger_info(self):

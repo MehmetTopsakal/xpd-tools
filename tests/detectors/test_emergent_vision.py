@@ -32,7 +32,8 @@ async def evt(tmp_path: Path) -> EmergentVisionDetector:
 @pytest.mark.parametrize(
     ("trigger_info", "image_mode", "framerate"),
     [
-        (TriggerInfo(number_of_events=3, livetime=0.5), ADImageMode.MULTIPLE, 30.0),
+        (TriggerInfo(number_of_events=3, livetime=0.5), ADImageMode.MULTIPLE, 2.0),
+        (TriggerInfo(number_of_events=3, livetime=2.0), ADImageMode.MULTIPLE, 1.0),
         (
             TriggerInfo(number_of_events=3, livetime=0.02, deadtime=0.01),
             ADImageMode.MULTIPLE,
@@ -55,6 +56,22 @@ async def test_prepare_internal(
         trigger_info.livetime * 1000
     )
     assert await driver.framerate.get_value() == framerate
+
+
+async def test_zero_deadtime_resets_framerate(evt: EmergentVisionDetector):
+    await evt.prepare(TriggerInfo(number_of_events=3, livetime=0.02, deadtime=0.98))
+    assert await evt.driver.framerate.get_value() == 1.0
+    await evt.prepare(TriggerInfo(number_of_events=3, livetime=0.02, deadtime=0))
+    assert await evt.driver.framerate.get_value() == 50.0
+
+
+async def test_readout_time_sets_deadtime(evt: EmergentVisionDetector):
+    await evt.driver.readout_time.set(0.005)
+    _, deadtime = await evt.get_trigger_deadtime()
+    assert deadtime == 0.005
+    assert "evt-driver-readout_time" in await evt.read_configuration()
+    await evt.prepare(TriggerInfo(number_of_events=3, livetime=0.02))
+    assert await evt.driver.framerate.get_value() == 40.0
 
 
 async def test_external_trigger_rejected(evt: EmergentVisionDetector):
