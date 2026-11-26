@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Annotated as A
 
 from ophyd_async.core import (
+    DEFAULT_TIMEOUT,
     DetectorTriggerLogic,
     DeviceMock,
     EnableDisable,
@@ -32,6 +33,7 @@ from ophyd_async.core import (
     SignalRW,
     StandardReadable,
     StrictEnum,
+    TriggerInfo,
     callback_on_mock_put,
     default_mock_class,
     set_mock_put_proceeds,
@@ -50,6 +52,8 @@ from ophyd_async.epics.adcore import (
     AreaDetector,
     NDFileHDF5IO,
     NDPluginBaseIO,
+    NDProcessIO,
+    prepare_filter,
     trigger_info_from_driver,
 )
 from ophyd_async.epics.core import PvSuffix
@@ -60,6 +64,10 @@ EVT_ACQUIRE_TIME_SCALE = 1000.0
 # Default minimum gap between frames (s); tune it at runtime through
 # ``driver.readout_time``.
 EVT_READOUT_TIME = 0.0
+
+# Margin (s) per frame for timeouts: frames of the HR-12000 arrive ~0.18 s
+# apart even at 30 fps
+EVT_FRAME_OVERHEAD = 0.5
 
 
 class EVTPixelFormat(StrictEnum):
@@ -136,9 +144,13 @@ class EmergentVisionTriggerLogic(DetectorTriggerLogic):
     ----------
     driver : EmergentVisionDriverIO
         The camera driver.
+    process_plugin : NDProcessIO, optional
+        Averages ``exposures_per_collection`` exposures into each written
+        frame by its filter (see ``prepare_filter``), by default None.
     """
 
     driver: EmergentVisionDriverIO
+    process_plugin: NDProcessIO | None = None
 
     def config_sigs(self) -> set[SignalR]:
         return {self.driver.readout_time}
@@ -172,9 +184,29 @@ class EmergentVisionTriggerLogic(DetectorTriggerLogic):
             ]
         await asyncio.gather(*coros)
 
+    async def prepare_exposures_per_collection(self, exposures_per_collection: int):
+        await prepare_filter(self.process_plugin, num_filter=exposures_per_collection)
+
     async def default_trigger_info(self):
-        """Get default trigger info based on the number of images to acquire."""
-        return await trigger_info_from_driver(self.driver.num_images)
+        """Get default trigger info based on the number of images to acquire.
+
+        The collection timeout allows for every exposure that the process
+        plugin averages into one frame, at the configured frame rate.
+        """
+        info, acquire_time_ms, framerate = await asyncio.gather(
+            trigger_info_from_driver(self.driver.num_images, self.process_plugin),
+            self.driver.acquire_time.get_value(),
+            self.driver.framerate.get_value(),
+        )
+        period = max(acquire_time_ms / EVT_ACQUIRE_TIME_SCALE, 1 / max(framerate, 1))
+        return TriggerInfo(
+            collections_per_event=info.collections_per_event,
+            exposures_per_collection=info.exposures_per_collection,
+            trigger=info.trigger,
+            collection_timeout=(period + EVT_FRAME_OVERHEAD)
+            * info.exposures_per_collection
+            + DEFAULT_TIMEOUT,
+        )
 
 
 class EmergentVisionDetectorMock(DeviceMock["EmergentVisionDetector"]):
@@ -194,9 +226,24 @@ class EmergentVisionDetectorMock(DeviceMock["EmergentVisionDetector"]):
         except (AttributeError, TypeError):
             hdf = None
 
+        try:
+            proc = device.get_plugin("proc", NDProcessIO)
+        except (AttributeError, TypeError, KeyError):
+            proc = None
+        # Frames the process plugin has averaged since its last output or reset
+        filtered = [0]
+
         set_mock_value(device.driver.acquire_time, 10.0)
         set_mock_value(device.driver.framerate, 30.0)
         set_mock_value(device.driver.num_images, 1)
+
+        async def _frame_written() -> bool:
+            if proc is not None and await proc.enable_filter.get_value():
+                filtered[0] += 1
+                if filtered[0] < await proc.num_filter.get_value():
+                    return False
+                filtered[0] = 0
+            return True
 
         async def _do_acquisition():
             num_images = await device.driver.num_images.get_value()
@@ -207,7 +254,7 @@ class EmergentVisionDetectorMock(DeviceMock["EmergentVisionDetector"]):
                 await asyncio.sleep(acquire_time)
                 counter = await device.driver.array_counter.get_value()
                 set_mock_value(device.driver.array_counter, counter + 1)
-                if hdf is not None:
+                if hdf is not None and await _frame_written():
                     num_captured = await hdf.num_captured.get_value()
                     set_mock_value(hdf.num_captured, num_captured + 1)
 
@@ -220,6 +267,9 @@ class EmergentVisionDetectorMock(DeviceMock["EmergentVisionDetector"]):
                 asyncio.ensure_future(_do_acquisition())
 
         callback_on_mock_put(device.driver.acquire, _on_acquire_write)
+        if proc is not None:
+            # prepare_filter resets the filter whenever it sets num_filter
+            callback_on_mock_put(proc.num_filter, lambda _: filtered.__setitem__(0, 0))
 
 
 @default_mock_class(EmergentVisionDetectorMock)
@@ -236,6 +286,11 @@ class EmergentVisionDetector(AreaDetector[EmergentVisionDriverIO]):
         Factories for file writer plugins and their data logics
     driver_suffix : str, optional
         Suffix for the driver PV, by default "cam1:"
+    proc_suffix : str, optional
+        If provided, an NDProcessIO plugin is created at this suffix and used
+        to average ``exposures_per_collection`` exposures per frame. The file
+        writer must be fed from this plugin, directly or through other
+        plugins. By default None.
     plugins : dict[str, NDPluginBaseIO], optional
         Additional areaDetector plugins to include, by default None
     config_sigs : Sequence[SignalR], optional
@@ -249,18 +304,20 @@ class EmergentVisionDetector(AreaDetector[EmergentVisionDriverIO]):
         prefix: str,
         *writer_factories: ADWriterFactory,
         driver_suffix="cam1:",
+        proc_suffix: str | None = None,
         plugins: dict[str, NDPluginBaseIO] | None = None,
         config_sigs: Sequence[SignalR] = (),
         name: str = "",
     ) -> None:
         driver = EmergentVisionDriverIO(prefix + driver_suffix)
+        proc_plugin = NDProcessIO(prefix + proc_suffix) if proc_suffix else None
         super().__init__(
             driver,
             prefix,
             *writer_factories,
             acquire_logic=ADAcquireLogic(driver),
-            trigger_logic=EmergentVisionTriggerLogic(driver),
-            plugins=plugins,
+            trigger_logic=EmergentVisionTriggerLogic(driver, proc_plugin),
+            plugins=(plugins or {}) | ({"proc": proc_plugin} if proc_plugin else {}),
             config_sigs=config_sigs,
             name=name,
         )

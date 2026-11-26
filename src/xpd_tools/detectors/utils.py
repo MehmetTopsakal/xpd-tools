@@ -1,11 +1,12 @@
 """Utility functions for xpd_tools detectors."""
 
 from collections.abc import Generator, Sequence
+from typing import Annotated as A
 from typing import Any
 
 import bluesky.plan_stubs as bps
 from bluesky.utils import Msg
-from ophyd_async.core import SignalR, derived_signal_r
+from ophyd_async.core import EnableDisable, SignalR, SignalRW, derived_signal_r
 from ophyd_async.epics.adcore import (
     NDROIIO,
     ADBaseColorMode,
@@ -16,6 +17,89 @@ from ophyd_async.epics.adcore import (
     NDProcessFilterType,
     NDProcessIO,
 )
+from ophyd_async.epics.core import PvSuffix
+
+
+class NDROIStartIO(NDROIIO):
+    """ROI plugin with the start, input size and scaling that `NDROIIO` lacks."""
+
+    min_x: A[SignalRW[int], PvSuffix.rbv("MinX")]
+    min_y: A[SignalRW[int], PvSuffix.rbv("MinY")]
+    max_size_x: A[SignalR[int], PvSuffix("MaxSizeX_RBV")]
+    max_size_y: A[SignalR[int], PvSuffix("MaxSizeY_RBV")]
+    enable_scale: A[SignalRW[EnableDisable], PvSuffix.rbv("EnableScale")]
+    scale: A[SignalRW[float], PvSuffix.rbv("Scale")]
+
+
+def set_roi(
+    roi: NDROIStartIO,
+    min_x: int,
+    min_y: int,
+    size_x: int,
+    size_y: int,
+    bin_x: int = 1,
+    bin_y: int = 1,
+) -> Generator[Msg, Any, dict[str, int]]:
+    """Set the region of an ROI plugin.
+
+    For example ``RE(set_roi(avt1_roi1, 0, 0, 1000, 1500, bin_x=2, bin_y=2))``.
+    The next scan's declared frame shape follows the new ROI, because
+    `plugin_array_description` reads it from ``SizeX/BinX`` and ``SizeY/BinY``.
+
+    Binned pixels are averaged rather than summed (``Scale`` is set to
+    ``bin_x * bin_y``), so they keep the camera's range and data type: a sum
+    would overflow, e.g. 4x4 binning of 8-bit pixels.
+
+    Parameters
+    ----------
+    roi : NDROIStartIO
+        The ROI plugin.
+    min_x, min_y : int
+        Start of the region (pixels of the plugin's input).
+    size_x, size_y : int
+        Size of the region before binning.
+    bin_x, bin_y : int, optional
+        Binning, by default 1.
+
+    Returns
+    -------
+    dict[str, int]
+        The settings read back from the IOC.
+    """
+    if min(min_x, min_y) < 0 or min(size_x, size_y, bin_x, bin_y) < 1:
+        raise ValueError(
+            "min_x and min_y must be >= 0, and size_x, size_y, bin_x and bin_y >= 1"
+        )
+    max_x: int = yield from bps.rd(roi.max_size_x)
+    max_y: int = yield from bps.rd(roi.max_size_y)
+    if min_x + size_x > max_x or min_y + size_y > max_y:
+        raise ValueError(
+            f"Region x={min_x}..{min_x + size_x}, y={min_y}..{min_y + size_y} "
+            f"does not fit the {max_x} x {max_y} input of {roi.name}"
+        )
+    # Start first, so the size is never checked against the old start
+    yield from bps.mv(roi.min_x, min_x, roi.min_y, min_y)
+    yield from bps.mv(
+        roi.size_x, size_x, roi.size_y, size_y, roi.bin_x, bin_x, roi.bin_y, bin_y
+    )
+    num_binned = bin_x * bin_y
+    yield from bps.mv(
+        roi.scale,
+        float(num_binned),
+        roi.enable_scale,
+        EnableDisable.ENABLE if num_binned > 1 else EnableDisable.DISABLE,
+    )
+    readback: dict[str, int] = {}
+    for key in ("min_x", "min_y", "size_x", "size_y", "bin_x", "bin_y"):
+        readback[key] = yield from bps.rd(getattr(roi, key))
+    print(
+        f"{roi.name}: start ({readback['min_x']}, {readback['min_y']}), "
+        f"size {readback['size_x']} x {readback['size_y']}, "
+        f"bin {readback['bin_x']} x {readback['bin_y']} -> frames "
+        f"{readback['size_x'] // readback['bin_x']} x "
+        f"{readback['size_y'] // readback['bin_y']} (x by y)"
+    )
+    return readback
 
 
 def _roi_output_size(size: int, binning: int) -> int:

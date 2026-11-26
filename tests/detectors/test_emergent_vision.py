@@ -11,7 +11,12 @@ from ophyd_async.core import (
     init_devices,
     set_mock_value,
 )
-from ophyd_async.epics.adcore import ADImageMode, ADWriterFactory
+from ophyd_async.epics.adcore import (
+    ADImageMode,
+    ADWriterFactory,
+    NDFileHDF5IO,
+    NDProcessIO,
+)
 
 from xpd_tools.detectors.emergent_vision import (
     EmergentVisionDetector,
@@ -100,3 +105,26 @@ def test_mock_internal_acquisition(RE: RunEngine, evt: EmergentVisionDetector):
 
     assert docs["stop"][0]["exit_status"] == "success"
     assert len(docs["stream_datum"]) == 1
+
+
+async def test_proc_plugin_averages_internal_exposures(tmp_path: Path):
+    path_provider = StaticPathProvider(UUIDFilenameProvider(), tmp_path)
+    async with init_devices(mock=True):
+        evt = EmergentVisionDetector(
+            "EVT:", ADWriterFactory.hdf(path_provider), proc_suffix="Proc1:", name="evt"
+        )
+    proc = evt.get_plugin("proc", NDProcessIO)
+    hdf = evt.get_plugin("hdf", NDFileHDF5IO)
+
+    await evt.stage()
+    await evt.prepare(
+        TriggerInfo(number_of_events=1, exposures_per_collection=3, livetime=0.001)
+    )
+    for _ in range(2):
+        await evt.trigger()
+
+    assert await proc.enable_filter.get_value()
+    assert await proc.num_filter.get_value() == 3
+    assert await evt.driver.num_images.get_value() == 3
+    assert await hdf.num_captured.get_value() == 2
+    await evt.unstage()

@@ -11,7 +11,12 @@ from ophyd_async.core import (
     init_devices,
     set_mock_value,
 )
-from ophyd_async.epics.adcore import ADImageMode, ADWriterFactory
+from ophyd_async.epics.adcore import (
+    ADImageMode,
+    ADWriterFactory,
+    NDFileHDF5IO,
+    NDProcessIO,
+)
 
 from xpd_tools.detectors.prosilica import (
     ProsilicaDetector,
@@ -172,3 +177,29 @@ async def test_legacy_rejects_level_trigger(prosilica_legacy: ProsilicaLegacyDet
                 deadtime=0.1,
             )
         )
+
+
+async def test_legacy_proc_plugin_averages_internal_exposures(tmp_path: Path):
+    path_provider = StaticPathProvider(UUIDFilenameProvider(), tmp_path)
+    async with init_devices(mock=True):
+        prosilica = ProsilicaLegacyDetector(
+            "PROS:",
+            ADWriterFactory.hdf(path_provider),
+            proc_suffix="Proc1:",
+            name="prosilica",
+        )
+    proc = prosilica.get_plugin("proc", NDProcessIO)
+    hdf = prosilica.get_plugin("hdf", NDFileHDF5IO)
+
+    await prosilica.stage()
+    await prosilica.prepare(
+        TriggerInfo(number_of_events=1, exposures_per_collection=3, livetime=0.001)
+    )
+    for _ in range(2):
+        await prosilica.trigger()
+
+    assert await proc.enable_filter.get_value()
+    assert await proc.num_filter.get_value() == 3
+    assert await prosilica.driver.num_images.get_value() == 3
+    assert await hdf.num_captured.get_value() == 2
+    await prosilica.unstage()

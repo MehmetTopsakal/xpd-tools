@@ -7,9 +7,16 @@ from ophyd_async.core import (
     StaticPathProvider,
     TriggerInfo,
     UUIDFilenameProvider,
+    get_mock_put,
     init_devices,
+    set_mock_value,
 )
-from ophyd_async.epics.adcore import ADImageMode, ADWriterFactory, NDProcessIO
+from ophyd_async.epics.adcore import (
+    ADImageMode,
+    ADWriterFactory,
+    NDFileHDF5IO,
+    NDProcessIO,
+)
 
 from xpd_tools.detectors.vimba import (
     VIMBA_READOUT_TIME,
@@ -50,7 +57,6 @@ async def test_zero_deadtime_resets_period(avt: VimbaDetector):
     assert await driver.acquire_period.get_value() == pytest.approx(
         0.02 + VIMBA_READOUT_TIME
     )
-    assert await driver.trigger_mode.get_value() == OnOff.OFF
 
 
 @pytest.mark.parametrize(
@@ -113,16 +119,33 @@ async def test_readout_time_sets_deadtime(avt: VimbaDetector):
     assert await avt.driver.acquire_period.get_value() == pytest.approx(0.025)
 
 
-async def test_single_internal_frame_uses_single_image_mode(avt: VimbaDetector):
-    # ImageMode=Multiple runs the Alvium in Continuous and overshoots NumImages.
+async def test_internal_prepare_uses_software_trigger(avt: VimbaDetector):
+    # Free-running ImageMode=Single/Multiple deliver extra frames on the Alvium.
     await avt.prepare(TriggerInfo(number_of_events=1, livetime=0.02))
-    assert await avt.driver.image_mode.get_value() == ADImageMode.SINGLE
-    assert await avt.driver.num_images.get_value() == 1
+    driver = avt.driver
+    assert await driver.trigger_mode.get_value() == OnOff.ON
+    assert await driver.trigger_source.get_value() == VimbaTriggerSourceAlvium.SOFTWARE
+    assert await driver.image_mode.get_value() == ADImageMode.CONTINUOUS
+    assert await driver.num_images.get_value() == 1
 
 
-async def test_multi_frame_internal_prepare_rejected(avt: VimbaDetector):
-    with pytest.raises(ValueError, match="extra frames"):
-        await avt.prepare(TriggerInfo(number_of_events=3, livetime=0.02))
+async def test_internal_trigger_takes_one_frame_per_software_pulse(
+    avt: VimbaDetector,
+):
+    hdf = avt.get_plugin("hdf", NDFileHDF5IO)
+    await avt.stage()
+    await avt.prepare(TriggerInfo(number_of_events=1, livetime=0.01))
+    for _ in range(3):
+        await avt.trigger()
+    assert await hdf.num_captured.get_value() == 3
+    assert get_mock_put(avt.driver.trigger_software).call_count == 3
+    # The camera keeps acquiring between triggers
+    assert await avt.driver.acquire.get_value()
+
+    await avt.unstage()
+    assert not await avt.driver.acquire.get_value()
+    # So Acquire from the camera GUI takes frames again
+    assert await avt.driver.trigger_mode.get_value() == OnOff.OFF
 
 
 async def _make_with_proc(tmp_path: Path) -> VimbaDetector:
@@ -157,11 +180,34 @@ async def test_proc_plugin_combines_external_exposures(tmp_path: Path):
     assert await avt.driver.num_images.get_value() == 10
 
 
-async def test_internal_multi_exposure_collection_rejected(tmp_path: Path):
-    # Combining exposures needs several frames per prepare, which overshoot
-    # in ImageMode=Multiple on this camera.
+async def test_internal_trigger_averages_exposures_in_proc_plugin(tmp_path: Path):
     avt = await _make_with_proc(tmp_path)
-    with pytest.raises(ValueError, match="extra frames"):
-        await avt.prepare(
-            TriggerInfo(number_of_events=1, exposures_per_collection=5, livetime=0.02)
-        )
+    hdf = avt.get_plugin("hdf", NDFileHDF5IO)
+    await avt.stage()
+    await avt.prepare(
+        TriggerInfo(number_of_events=1, exposures_per_collection=3, livetime=0.01)
+    )
+    for _ in range(2):
+        await avt.trigger()
+    assert await hdf.num_captured.get_value() == 2
+    assert get_mock_put(avt.driver.trigger_software).call_count == 6
+    await avt.unstage()
+
+
+async def test_unprepared_trigger_averages_proc_filter_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # With preserved detector state, trigger() reads exposures per collection
+    # from the process plugin filter, as in the beamline profile.
+    monkeypatch.setenv("OPHYD_ASYNC_PRESERVE_DETECTOR_STATE", "YES")
+    avt = await _make_with_proc(tmp_path)
+    proc = avt.get_plugin("proc", NDProcessIO)
+    set_mock_value(proc.enable_filter, True)
+    set_mock_value(proc.num_filter, 4)
+    set_mock_value(avt.driver.acquire_time, 0.01)
+    hdf = avt.get_plugin("hdf", NDFileHDF5IO)
+    await avt.stage()
+    await avt.trigger()
+    assert await hdf.num_captured.get_value() == 1
+    assert get_mock_put(avt.driver.trigger_software).call_count == 4
+    await avt.unstage()

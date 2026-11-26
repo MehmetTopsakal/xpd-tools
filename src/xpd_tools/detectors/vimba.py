@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Annotated as A
 
 from ophyd_async.core import (
+    DEFAULT_TIMEOUT,
+    AsyncStatus,
     DetectorTriggerLogic,
     DeviceMock,
     OnOff,
@@ -13,11 +15,14 @@ from ophyd_async.core import (
     SignalR,
     SignalRW,
     StrictEnum,
+    TriggerInfo,
     callback_on_mock_put,
     default_mock_class,
+    set_and_wait_for_value,
     set_mock_put_proceeds,
     set_mock_value,
     soft_signal_rw,
+    wait_for_value,
 )
 from ophyd_async.epics.adcore import (
     ADAcquireLogic,
@@ -38,6 +43,9 @@ from ophyd_async.epics.core import PvSuffix
 # Default frame readout time (s) for Allied Vision Alvium cameras; tune it at
 # runtime through ``driver.readout_time``.
 VIMBA_READOUT_TIME = 0.01
+# Measured time (s) per software-triggered frame beyond the exposure is ~0.12 s;
+# allow more in timeouts
+VIMBA_TRIGGER_OVERHEAD = 0.5
 
 
 class VimbaTriggerSourceAlvium(StrictEnum):
@@ -90,6 +98,9 @@ class VimbaDriverIO(ADBaseIO):
     trigger_mode: A[SignalRW[OnOff], PvSuffix.rbv("TriggerMode")]
     trigger_overlap: A[SignalRW[VimbaOverlapAlvium], PvSuffix.rbv("TriggerOverlap")]
     exposure_mode: A[SignalRW[VimbaExposeOutModeAlvium], PvSuffix.rbv("ExposureMode")]
+    # bo record ('Done', 'Trigger'); writing True takes one frame when the camera
+    # is acquiring with TriggerMode=On and TriggerSource=Software
+    trigger_software: A[SignalRW[bool], PvSuffix("TriggerSoftware")]
 
     def __init__(self, prefix: str, name: str = ""):
         super().__init__(prefix, name=name)
@@ -133,32 +144,26 @@ class VimbaTriggerLogic(DetectorTriggerLogic):
             )
 
     async def prepare_internal(self, num: int, livetime: float, deadtime: float):
-        """Prepare the camera for internally triggered acquisition.
+        """Prepare the camera for software-triggered acquisition of ``num`` frames.
 
         With no requested deadtime the frame period is set to the exposure
         plus ``driver.readout_time``, the shortest gap the camera supports.
 
-        Alvium cameras lack the GenICam ``MultiFrame`` mode, so ADVimba runs
-        ``ImageMode=Multiple`` as ``Continuous`` and delivers extra frames
-        before it stops the camera. A single frame therefore uses
-        ``ImageMode=Single`` (``SingleFrame``), and multi-frame internal
-        acquisitions are refused; use ``bp.count(..., num=N)`` instead.
+        Free-running modes deliver extra frames on Alvium cameras: ADVimba runs
+        ``ImageMode=Multiple`` as ``Continuous`` and overshoots, and
+        ``ImageMode=Single`` sometimes starts a second exposure by itself. So
+        the camera acquires continuously with ``TriggerMode=On`` and
+        ``TriggerSource=Software``, and `VimbaAcquireLogic` sends one
+        ``TriggerSoftware`` pulse per frame, ``num`` (``NumImages``) per
+        trigger or kickoff.
         """
-        if num > 1:
-            raise ValueError(
-                f"Internal triggering of {num} frames per prepare is not "
-                "supported: the camera delivers extra frames in "
-                "ImageMode=Multiple. Use one frame per trigger, e.g. "
-                "num_images=1 with bp.count([det], num=N)."
-            )
         if livetime and not deadtime:
             deadtime = await self.driver.readout_time.get_value()
-        image_mode = ADImageMode.SINGLE if num == 1 else ADImageMode.CONTINUOUS
         coros = [
             self.driver.trigger_source.set(VimbaTriggerSourceAlvium.SOFTWARE),
-            self.driver.trigger_mode.set(OnOff.OFF),
+            self.driver.trigger_mode.set(OnOff.ON),
             self.driver.exposure_mode.set(VimbaExposeOutModeAlvium.TIMED),
-            self.driver.image_mode.set(image_mode),
+            self.driver.image_mode.set(ADImageMode.CONTINUOUS),
             self.driver.num_images.set(num),
         ]
         if livetime:
@@ -191,10 +196,87 @@ class VimbaTriggerLogic(DetectorTriggerLogic):
         await prepare_filter(self.process_plugin, num_filter=exposures_per_collection)
 
     async def default_trigger_info(self):
-        """Get default trigger info based on the number of images to acquire."""
-        return await trigger_info_from_driver(
-            self.driver.num_images, self.process_plugin
+        """Get default trigger info based on the number of images to acquire.
+
+        The collection timeout allows for every exposure that the process
+        plugin averages into one frame, plus the software-trigger overhead.
+        """
+        info, acquire_time = await asyncio.gather(
+            trigger_info_from_driver(self.driver.num_images, self.process_plugin),
+            self.driver.acquire_time.get_value(),
         )
+        return TriggerInfo(
+            collections_per_event=info.collections_per_event,
+            exposures_per_collection=info.exposures_per_collection,
+            trigger=info.trigger,
+            collection_timeout=(acquire_time + VIMBA_TRIGGER_OVERHEAD)
+            * info.exposures_per_collection
+            + DEFAULT_TIMEOUT,
+        )
+
+
+class VimbaAcquireLogic(ADAcquireLogic):
+    """Acquire logic that takes one frame per ``TriggerSoftware`` pulse.
+
+    When the camera is set up for software triggering (``TriggerMode=On`` and
+    ``TriggerSource=Software``, see `VimbaTriggerLogic.prepare_internal`), it
+    keeps acquiring between triggers and each `start_acquiring` sends
+    ``NumImages`` pulses. Other modes, such as external triggering, use
+    `ADAcquireLogic`.
+    """
+
+    def __init__(self, driver: VimbaDriverIO):
+        super().__init__(driver)
+        self.vimba_driver = driver
+        self.trigger_status: AsyncStatus | None = None
+
+    async def _software_triggered(self) -> bool:
+        mode, source = await asyncio.gather(
+            self.vimba_driver.trigger_mode.get_value(),
+            self.vimba_driver.trigger_source.get_value(),
+        )
+        return mode == OnOff.ON and source == VimbaTriggerSourceAlvium.SOFTWARE
+
+    async def _send_triggers(self, num: int) -> None:
+        acquire_time = await self.driver.acquire_time.get_value()
+        for _ in range(num):
+            frames = await self.driver.array_counter.get_value(cached=False)
+            await self.vimba_driver.trigger_software.set(True, timeout=None)
+            # The camera ignores pulses while it is exposing, so wait for the frame
+            await wait_for_value(
+                self.driver.array_counter,
+                lambda count, frames=frames: count > frames,
+                timeout=acquire_time + VIMBA_TRIGGER_OVERHEAD + DEFAULT_TIMEOUT,
+            )
+
+    async def start_acquiring(self):
+        if not await self._software_triggered():
+            await super().start_acquiring()
+            return
+        if not await self.driver.acquire.get_value():
+            # Completes when acquisition is stopped in ensure_stopped
+            self.acquire_status = await set_and_wait_for_value(
+                self.driver.acquire, True, wait_for_set_completion=False
+            )
+        num = await self.driver.num_images.get_value()
+        self.trigger_status = AsyncStatus(self._send_triggers(num))
+
+    async def wait_for_idle(self):
+        if not await self._software_triggered():
+            await super().wait_for_idle()
+        elif self.trigger_status:
+            # Acquisition keeps running until ensure_stopped
+            await self.trigger_status
+
+    async def ensure_stopped(self):
+        if self.trigger_status and not self.trigger_status.done:
+            self.trigger_status.task.cancel()
+        await super().ensure_stopped()
+        self.acquire_status = None
+        self.trigger_status = None
+        if await self._software_triggered():
+            # Let Acquire from the camera GUI take frames again
+            await self.vimba_driver.trigger_mode.set(OnOff.OFF)
 
 
 class VimbaDetectorMock(DeviceMock["VimbaDetector"]):
@@ -215,38 +297,71 @@ class VimbaDetectorMock(DeviceMock["VimbaDetector"]):
         except (AttributeError, TypeError):
             hdf = None
 
+        try:
+            proc = device.get_plugin("proc", NDProcessIO)
+        except (AttributeError, TypeError, KeyError):
+            proc = None
+        # Frames the process plugin has averaged since its last output or reset
+        filtered = [0]
+
         set_mock_value(device.driver.acquire_time, 0.1)
         set_mock_value(device.driver.acquire_period, 0.1 + VIMBA_READOUT_TIME)
         set_mock_value(device.driver.num_images, 1)
         set_mock_value(device.driver.trigger_source, VimbaTriggerSourceAlvium.SOFTWARE)
 
-        async def _do_acquisition():
-            trigger_source = await device.driver.trigger_source.get_value()
-            if trigger_source != VimbaTriggerSourceAlvium.SOFTWARE:
-                set_mock_put_proceeds(device.driver.acquire, True)
-                return
+        async def _capture_frame():
+            await asyncio.sleep(await device.driver.acquire_time.get_value())
+            frames = await device.driver.array_counter.get_value()
+            set_mock_value(device.driver.array_counter, frames + 1)
+            if proc is not None and await proc.enable_filter.get_value():
+                filtered[0] += 1
+                if filtered[0] < await proc.num_filter.get_value():
+                    return
+                filtered[0] = 0
+            if hdf is not None:
+                num_captured = await hdf.num_captured.get_value()
+                set_mock_value(hdf.num_captured, num_captured + 1)
 
+        async def _do_acquisition():
             num_images = await device.driver.num_images.get_value()
             acquire_time = await device.driver.acquire_time.get_value()
             acquire_period = await device.driver.acquire_period.get_value()
 
             for i in range(num_images):
-                await asyncio.sleep(acquire_time)
-                if hdf is not None:
-                    num_captured = await hdf.num_captured.get_value()
-                    set_mock_value(hdf.num_captured, num_captured + 1)
+                await _capture_frame()
                 if i < num_images - 1:
                     await asyncio.sleep(max(acquire_period - acquire_time, 0))
 
             set_mock_value(device.driver.acquire, False)
             set_mock_put_proceeds(device.driver.acquire, True)
 
-        def _on_acquire_write(value: bool) -> None:
-            if value:
+        async def _on_acquire_write(value: bool) -> None:
+            if not value:
+                set_mock_put_proceeds(device.driver.acquire, True)
+                return
+            mode, source = await asyncio.gather(
+                device.driver.trigger_mode.get_value(),
+                device.driver.trigger_source.get_value(),
+            )
+            if mode == OnOff.OFF:
                 set_mock_put_proceeds(device.driver.acquire, False)
                 asyncio.ensure_future(_do_acquisition())
+            elif source == VimbaTriggerSourceAlvium.SOFTWARE:
+                # Frames come from TriggerSoftware pulses; the put completes when
+                # acquisition is stopped
+                set_mock_put_proceeds(device.driver.acquire, False)
+            else:
+                set_mock_put_proceeds(device.driver.acquire, True)
+
+        def _on_trigger_software_write(value: bool) -> None:
+            if value:
+                asyncio.ensure_future(_capture_frame())
 
         callback_on_mock_put(device.driver.acquire, _on_acquire_write)
+        callback_on_mock_put(device.driver.trigger_software, _on_trigger_software_write)
+        if proc is not None:
+            # prepare_filter resets the filter whenever it sets num_filter
+            callback_on_mock_put(proc.num_filter, lambda _: filtered.__setitem__(0, 0))
 
 
 @default_mock_class(VimbaDetectorMock)
@@ -265,8 +380,9 @@ class VimbaDetector(AreaDetector[VimbaDriverIO]):
         External trigger source line, by default ``SOFTWARE``
     proc_suffix : str, optional
         If provided, an NDProcessIO plugin is created at this suffix and used
-        to combine ``exposures_per_collection`` exposures per frame. The file
-        writer must be fed from this plugin. By default None.
+        to average ``exposures_per_collection`` exposures per frame. The file
+        writer must be fed from this plugin, directly or through other plugins
+        such as ROI. By default None.
     plugins : dict[str, NDPluginBaseIO], optional
         Additional areaDetector plugins to include, by default None
     config_sigs : Sequence[SignalR], optional
@@ -292,7 +408,7 @@ class VimbaDetector(AreaDetector[VimbaDriverIO]):
             driver,
             prefix,
             *writer_factories,
-            acquire_logic=ADAcquireLogic(driver),
+            acquire_logic=VimbaAcquireLogic(driver),
             trigger_logic=VimbaTriggerLogic(driver, trigger_input, proc_plugin),
             plugins=(plugins or {}) | ({"proc": proc_plugin} if proc_plugin else {}),
             config_sigs=config_sigs,
