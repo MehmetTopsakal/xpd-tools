@@ -14,6 +14,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 
 import bluesky.plan_stubs as bps
 import bluesky.plans as bp
+from bluesky import preprocessors as bpp
 from bluesky.callbacks.best_effort import BestEffortCallback
 from bluesky.run_engine import (
     RunEngine,
@@ -27,7 +28,7 @@ from IPython.terminal.interactiveshell import TerminalInteractiveShell
 from nslsii.ophyd_async.devices import Xspress3Detector, Xspress3HDFWriterFactory
 from nslsii.ophyd_async.providers import NSLS2PathProvider
 from nslsii.sync_experiment import sync_experiment
-from ophyd_async.core import init_devices, print_connection_status
+from ophyd_async.core import StandardReadable, init_devices, print_connection_status, PathInfo, PathProvider
 from ophyd_async.epics.adcore import (
     ADWriterFactory,
     NDFileHDF5IO,
@@ -37,11 +38,29 @@ from ophyd_async.epics.adcore import (
     PluginSignalDataLogic,
 )
 from ophyd_async.epics.adkinetix import KinetixDetector
+from ophyd_async.epics.core import epics_signal_rw
+from ophyd_async.sim import SimMotor
 from ophyd_async.epics.motor import Motor as AsyncEpicsMotor
 from ophyd_async.fastcs.panda import HDFPanda
 from ophyd_async.plan_stubs import retrieve_settings, store_settings
 from rich import print as rprint
 from tiled.client import from_uri
+
+from ophyd_async.core import (
+    AsyncMovable,
+    AsyncStatus,
+    SignalR,
+    StandardReadable,
+    StrictEnum,
+    default_mock_class,
+    derived_signal_r,
+    observe_signals_value,
+    wait_for_value,
+)
+from ophyd_async.core import (
+    StandardReadableFormat as Format,
+)
+
 
 from xpd_tools.detectors import (
     EmergentVisionDetector,
@@ -51,10 +70,12 @@ from xpd_tools.detectors import (
 from xpd_tools.detectors.dexela import DexelaDetector
 from xpd_tools.detectors.pilatus4 import Pilatus4Detector
 from xpd_tools.detectors.utils import NDROIStartIO, plugin_array_description, set_roi
-from xpd_tools.motors import RotationMotor
+from xpd_tools.machine import NSLS2OpsMode, NSLS2StorageRing
+from xpd_tools.motors import RotationMotor, SampleStack, Slits
 from xpd_tools.plans import *
 from xpd_tools.psylotech import Psylotech
 from xpd_tools.shutter import FastShutter, PPSShutter, Shutter
+from xpd_tools.suspenders import SuspendFloorUnlessOpsMode
 from xpd_tools.tomo import *
 from xpd_tools.tomo import LastDarkFlatUIDTracker
 from xpd_tools.utils import (
@@ -199,6 +220,21 @@ avt1_path_provider = _windows_path_provider()
 evt1_path_provider = _windows_path_provider()
 
 
+class FixedAssetDirPathProvider(PathProvider):
+    """Use a fixed asset directory name, independent of the device name."""
+
+    def __init__(self, provider: PathProvider, asset_dir_name: str):
+        self._provider = provider
+        self._asset_dir_name = asset_dir_name
+
+    def __call__(self, datakey_name: str | None = None) -> PathInfo:
+        return self._provider(self._asset_dir_name)
+
+xs3_path_provider = FixedAssetDirPathProvider(path_provider, "xspress3-1")
+
+prosilica1_path_provider = FixedAssetDirPathProvider(path_provider, "default")
+
+
 #############
 # DETECTORS #
 #############
@@ -293,12 +329,12 @@ with init_devices(
     prosilica1 = ProsilicaLegacyDetector(
         "XF:28IDD-BI{Det-Sample:1}",
         ADWriterFactory.hdf(
-            path_provider,
+            prosilica1_path_provider,
             array_description=plugin_array_description(prosilica1_roi1),
         ),
         proc_suffix="Proc1:",
         plugins={"trans1": prosilica1_trans1, "roi1": prosilica1_roi1},
-        name="default",
+        name="prosilica1",
     )
 
     # --- AVT (Vimba) ---
@@ -337,13 +373,13 @@ with init_devices(
         name="evt1",
     )
 
-    # --- Xspress3 fluorescence detector (prefix and channels from xpdDacq) ---
+    # --- Xspress3 fluorescence detector
     xs3 = Xspress3Detector(
         "XF:28ID2-ES{Xsp:1}:",
-        Xspress3HDFWriterFactory(path_provider, hinted_streams=[]),
+        Xspress3HDFWriterFactory(xs3_path_provider, hinted_streams=[]),
         channel_numbers=(1,),
-        mca_roi_numbers=(1,),
-        name="xspress3-1",
+        mca_roi_numbers=(1,2),
+        name="xs3", # was "xspress3-1"
     )
 
 
@@ -447,27 +483,110 @@ except Exception as _exc:
 ##########
 # MOTORS #
 ##########
+
+
 with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
     # psylo = Psylotech("XF:28ID2-ES{Psylotech:1}", name="psylo")
 
     # The beamline names these motors in mixedCase, which the users rely on.
     # amPhi is a RotationMotor so it can be fly-scanned with the PandA encoder;
     # the others are plain AsyncEpicsMotors.
-    amBaseX = AsyncEpicsMotor(  # noqa: N816
+
+    mBaseX = AsyncEpicsMotor(  # noqa: N816
         "XF:28IDD-ES:2{Stg:Stack-Ax:Xbase}Mtr", name="amBaseX"
     )
-    amBaseY = AsyncEpicsMotor(  # noqa: N816
+    mBaseY = AsyncEpicsMotor(  # noqa: N816
         "XF:28IDD-ES:2{Stg:Stack-Ax:Y}Mtr", name="amBaseY"
     )
     amPhi = RotationMotor(  # noqa: N816
         "XF:28IDD-ES:2{Stg:Stack-Ax:Phi2}Mtr", name="amPhi", panda_encoder=1
     )
-    amTopX = AsyncEpicsMotor(  # noqa: N816
+    mTopX = AsyncEpicsMotor(  # noqa: N816
         "XF:28IDD-ES:2{Stg:Stack-Ax:Xfine}Mtr", name="amTopX"
     )
-    amTopZ = AsyncEpicsMotor(  # noqa: N816
+    mTopZ = AsyncEpicsMotor(  # noqa: N816
         "XF:28IDD-ES:2{Stg:Stack-Ax:Z}Mtr", name="amTopZ"
     )
+
+    slits = Slits("XF:28IDD-ES:2{Slt-Ax:", name="slits")
+
+    sample_stack = SampleStack(  # noqa: N816
+        "XF:28IDD-ES:2{Stg:Stack-Ax:", name="sample_stack"
+    )
+
+    mDetX = AsyncEpicsMotor(  # noqa: N816
+        "XF:28IDD-ES:2{Cam:Mnt-Ax:X}Mtr", name="mDetX"
+    )
+
+    mSigrayZ = AsyncEpicsMotor(  # noqa: N816
+        "XF:28IDD-ES:2{Stg:Sigray-Ax:Z}Mtr", name="mSigrayZ"
+    )
+    mVisibleX = AsyncEpicsMotor(  # noqa: N816
+        "XF:28IDD-ES:2{Stg:Sigray-Ax:X}Mtr", name="mVisibleX"
+    )
+    mEmergentY = AsyncEpicsMotor(  # noqa: N816
+        "XF:28IDD-ES:2{Stg:Sigray-Ax:Y}Mtr", name="mEmergentY"
+    )
+
+    mFastShutter = AsyncEpicsMotor(  # noqa: N816
+        "XF:28IDC-ES:1{Sh2:Exp-Ax:5}Mtr", name="mFastShutter"
+    )
+
+    # mMirrorBendDS = AsyncEpicsMotor(  # noqa: N816
+    #     "XF:28IDA-OP:1{Mir:VFM-Ax:BndD}Mtr", name="mMirrorBendDS"
+    # )
+    # mMirrorBendUS = AsyncEpicsMotor(  # noqa: N816
+    #     "XF:28IDA-OP:1{Mir:VFM-Ax:BndU}Mtr", name="mMirrorBendUS"
+    # )
+    # mMirrorY = AsyncEpicsMotor(  # noqa: N816
+    #     "XF:28IDA-OP:1{Mir:VFM-Ax:Y}Mtr", name="mMirrorY"
+    # )
+
+    # A few fake motors, useful for testing
+    fake_motor_x = SimMotor(name="fake_motor_x", instant=False)
+    fake_motor_y = SimMotor(name="fake_motor_y", instant=False)
+    fake_motor_z = SimMotor(name="fake_z", instant=False)
+
+
+    # Storage ring information
+    storage_ring = NSLS2StorageRing()
+
+
+
+# # Fast shutter
+# mFastShutter = EpicsMotor("XF:28IDC-ES:1{Sh2:Exp-Ax:5}Mtr", name="mFastShutter")
+
+# # Mirror
+# mMirrorY = EpicsMotor("XF:28IDA-OP:1{Mir:VFM-Ax:Y}Mtr", name="mMirrorY")
+# mMirrorBendDS = EpicsMotor("XF:28IDA-OP:1{Mir:VFM-Ax:BndD}Mtr", name="mMirrorBendDS")
+# mMirrorBendUS = EpicsMotor("XF:28IDA-OP:1{Mir:VFM-Ax:BndU}Mtr", name="mMirrorBendUS")
+
+###########
+# FILTERS #
+###########
+
+
+class FilterBank(StandardReadable):
+    """Four-slot filter bank."""
+
+    def __init__(self, prefix: str, name: str = ""):
+        with self.add_children_as_readables():
+            self.flt1 = epics_signal_rw(str, f"{prefix}1-Cmd")
+            self.flt2 = epics_signal_rw(str, f"{prefix}2-Cmd")
+            self.flt3 = epics_signal_rw(str, f"{prefix}3-Cmd")
+            self.flt4 = epics_signal_rw(str, f"{prefix}4-Cmd")
+        super().__init__(name=name)
+
+
+with init_devices(mock=XPDTOOLS_RUNNING_IN_CI):
+    filters = FilterBank("XF:28IDC-OP:1{Fltr}Cmd:Opn", name="fb")  # noqa: N816
+    storage_ring = NSLS2StorageRing()
+
+
+
+
+
+
 
 
 ############
@@ -479,3 +598,43 @@ with init_devices(mock=True):
     fe_shutter = Shutter("XF:28ID-PPS{Sh:FE}", name="fe_shutter")
     photon_shutter = Shutter("XF:28IDA-PPS{PSh}", name="photon_shutter")
     fast_shutter = FastShutter(name="fast_shutter")
+
+
+
+############
+# baseline #
+############
+# Configure baseline supplemental data to include in the metadata of every run.
+sd = bpp.SupplementalData(
+    baseline=[
+        slits,
+        sample_stack,
+        filters,
+        mDetX,
+        mSigrayZ,
+        mVisibleX,
+        mEmergentY,
+        mFastShutter,
+        storage_ring.beam_current,
+    ]
+)
+RE.preprocessors.append(sd)
+
+bec.disable_baseline()
+
+# Pause the RunEngine if the beam current drops below 100 mA and resume above
+# 390 mA. Always installed; it ignores low beam while the ring is in maintenance
+# or shutdown, checking the mode each time rather than once at startup.
+RE.install_suspender(
+    SuspendFloorUnlessOpsMode(
+        storage_ring.beam_current,
+        100,
+        resume_thresh=390,
+        sleep=600,
+        ops_mode=storage_ring.operating_mode,
+        skip_modes=(NSLS2OpsMode.MAINTENANCE,
+                    NSLS2OpsMode.SHUTDOWN,
+                    NSLS2OpsMode.ACCEL_STUDIES
+                    ),
+    )
+)

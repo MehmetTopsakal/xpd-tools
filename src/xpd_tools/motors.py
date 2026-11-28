@@ -7,11 +7,16 @@ from bluesky.protocols import Flyable, Preparable
 from ophyd_async.core import (
     DeviceMock,
     SignalR,
+    StandardReadable,
     callback_on_mock_put,
     default_mock_class,
     derived_signal_r,
+    derived_signal_rw,
     set_mock_put_proceeds,
     set_mock_value,
+)
+from ophyd_async.core import (
+    StandardReadableFormat as Format,
 )
 from ophyd_async.epics.core import epics_signal_r
 from ophyd_async.epics.motor import Motor as AsyncEpicsMotor
@@ -134,3 +139,115 @@ class RotationMotor(AsyncEpicsMotor):
             The number of encoder counts per revolution.
         """
         return round(360.0 / encoder_resolution)
+
+
+class Slits(StandardReadable):
+    """Four-blade slits with derived gap and center signals."""
+
+    def __init__(self, prefix: str, name: str = ""):
+        with self.add_children_as_readables():
+            self.top = AsyncEpicsMotor(f"{prefix}T}}Mtr")
+            self.bottom = AsyncEpicsMotor(f"{prefix}B}}Mtr")
+            self.outboard = AsyncEpicsMotor(f"{prefix}O}}Mtr")
+            self.inboard = AsyncEpicsMotor(f"{prefix}I}}Mtr")
+
+        with self.add_children_as_readables(Format.HINTED_SIGNAL):
+            self.v_gap = derived_signal_rw(
+                self._get_v_gap,
+                self._set_v_gap,
+                top=self.top.user_readback,
+                bottom=self.bottom.user_readback,
+            )
+            self.h_gap = derived_signal_rw(
+                self._get_h_gap,
+                self._set_h_gap,
+                outboard=self.outboard.user_readback,
+                inboard=self.inboard.user_readback,
+            )
+
+        with self.add_children_as_readables():
+            self.v_center = derived_signal_rw(
+                self._get_v_center,
+                self._set_v_center,
+                top=self.top.user_readback,
+                bottom=self.bottom.user_readback,
+            )
+            self.h_center = derived_signal_rw(
+                self._get_h_center,
+                self._set_h_center,
+                outboard=self.outboard.user_readback,
+                inboard=self.inboard.user_readback,
+            )
+
+        super().__init__(name=name)
+
+    def _get_v_gap(self, top: float, bottom: float) -> float:
+        return top - bottom
+
+    async def _set_v_gap(self, value: float) -> None:
+        top, bottom = await asyncio.gather(
+            self.top.user_readback.get_value(),
+            self.bottom.user_readback.get_value(),
+        )
+        center = (top + bottom) / 2.0
+        await asyncio.gather(
+            self.top.set(center + value / 2.0),
+            self.bottom.set(center - value / 2.0),
+        )
+
+    def _get_v_center(self, top: float, bottom: float) -> float:
+        return (top + bottom) / 2.0
+
+    async def _set_v_center(self, value: float) -> None:
+        top, bottom = await asyncio.gather(
+            self.top.user_readback.get_value(),
+            self.bottom.user_readback.get_value(),
+        )
+        gap = top - bottom
+        await asyncio.gather(
+            self.top.set(value + gap / 2.0),
+            self.bottom.set(value - gap / 2.0),
+        )
+
+    def _get_h_gap(self, outboard: float, inboard: float) -> float:
+        return outboard - inboard
+
+    async def _set_h_gap(self, value: float) -> None:
+        outboard, inboard = await asyncio.gather(
+            self.outboard.user_readback.get_value(),
+            self.inboard.user_readback.get_value(),
+        )
+        center = (outboard + inboard) / 2.0
+        await asyncio.gather(
+            self.outboard.set(center + value / 2.0),
+            self.inboard.set(center - value / 2.0),
+        )
+
+    def _get_h_center(self, outboard: float, inboard: float) -> float:
+        return (outboard + inboard) / 2.0
+
+    async def _set_h_center(self, value: float) -> None:
+        outboard, inboard = await asyncio.gather(
+            self.outboard.user_readback.get_value(),
+            self.inboard.user_readback.get_value(),
+        )
+        gap = outboard - inboard
+        await asyncio.gather(
+            self.outboard.set(value + gap / 2.0),
+            self.inboard.set(value - gap / 2.0),
+        )
+
+
+class SampleStack(StandardReadable):
+    """Sample stack motors."""
+
+    def __init__(self, prefix: str, name: str = ""):
+        with self.add_children_as_readables():
+            self.phi = AsyncEpicsMotor(f"{prefix}Phi}}Mtr")
+            self.top_x = AsyncEpicsMotor(f"{prefix}Xfine}}Mtr")
+            self.top_z = AsyncEpicsMotor(f"{prefix}Z}}Mtr")
+            self.roll = AsyncEpicsMotor(f"{prefix}Roll}}Mtr")
+            self.pitch = AsyncEpicsMotor(f"{prefix}Pitch}}Mtr")
+            self.base_y = AsyncEpicsMotor(f"{prefix}Y}}Mtr")
+            self.base_x = AsyncEpicsMotor(f"{prefix}Xbase}}Mtr")
+        super().__init__(name=name)

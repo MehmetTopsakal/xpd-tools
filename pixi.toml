@@ -13,6 +13,7 @@ redis-json-dict = ">=0.2.2,<0.3"
 rich = ">=15.0.0,<16"
 scipy = ">=1.17.1,<2"
 ipykernel = ">=7.4.0,<8"
+jupyterlab = ">=4.6.6,<5"
 
 [pypi-dependencies]
 xpd-tools = { path = ".", editable = true }
